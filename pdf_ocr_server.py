@@ -122,7 +122,7 @@ async def process_page_with_vllm(page_image_bytes: bytes, page_num: int) -> str:
                     ]
                 }
             ],
-            "max_tokens": 8192,  # Максимум токенов для вывода
+            "max_tokens": 4096,  # Максимум токенов для вывода
             "temperature": 0.1,  # Низкая температура для детерминированного извлечения текста
             "top_p": 0.95
         }
