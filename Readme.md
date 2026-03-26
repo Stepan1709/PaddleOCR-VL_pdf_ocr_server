@@ -1,7 +1,7 @@
 
 # PDF OCR Server with PaddleOCR-VL
 
-### Сервер для OCR обработки PDF файлов с использованием модели PaddlePaddle/PaddleOCR-VL через vLLM.
+### Сервер для OCR обработки PDF файлов с использованием модели PaddlePaddle/PaddleOCR-VL через vLLM на удаленном сервере.
 
 ## Настройка окружения
 
@@ -26,6 +26,12 @@ docker build -t paddle-pdf-ocr-server:latest .
 
 ```bash
 docker run -d --name paddle-pdf-ocr-server -p 9000:9000 --restart unless-stopped paddle-pdf-ocr-server:latest
+```
+
+## Получение логов
+
+```bash
+docker logs -f --tail 100 paddle-pdf-ocr-server
 ```
 
 ## Использование API
