@@ -101,6 +101,7 @@ async def process_page_with_vllm(page_image_bytes: bytes, page_num: int, retry_c
     """
     for attempt in range(retry_count):
         try:
+            await asyncio.sleep(3)
             # Кодируем изображение в base64
             image_base64 = base64.b64encode(page_image_bytes).decode('utf-8')
             image_url = f"data:image/png;base64,{image_base64}"
@@ -164,7 +165,7 @@ async def process_page_with_vllm(page_image_bytes: bytes, page_num: int, retry_c
             logger.warning(f"Ошибка при обработке страницы {page_num} (попытка {attempt + 1}/{retry_count}): {e}")
             if attempt < retry_count - 1:
                 # Ждем перед повторной попыткой (экспоненциальная задержка)
-                wait_time = 2 ** attempt  # 1, 2, 4 секунды
+                wait_time = 3 + (2 ** attempt)
                 await asyncio.sleep(wait_time)
             else:
                 logger.error(f"Страница {page_num}: все попытки ({retry_count}) не удались")
