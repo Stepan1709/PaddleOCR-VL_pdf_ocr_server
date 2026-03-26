@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
     global session
     # Запуск: создаем сессию с увеличенными таймаутами
-    timeout = ClientTimeout(total=60, connect=30, sock_read=60)
+    timeout = ClientTimeout(total=60, connect=30, sock_read=120)
     session = aiohttp.ClientSession(timeout=timeout)
     logger.info(f"🚀 Сервер запущен на http://{HOST}:{PORT}")
     logger.info(f"📡 Подключен к vLLM: {VLLM_URL}")
