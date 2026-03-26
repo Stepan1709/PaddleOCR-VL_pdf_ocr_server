@@ -14,6 +14,7 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 import asyncio
 import aiohttp
+from aiohttp import ClientTimeout, ClientError
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import PlainTextResponse
 import PyPDF2
@@ -45,8 +46,9 @@ session = None
 async def lifespan(app: FastAPI):
     """Управление жизненным циклом приложения"""
     global session
-    # Запуск: создаем сессию
-    session = aiohttp.ClientSession()
+    # Запуск: создаем сессию с увеличенными таймаутами
+    timeout = ClientTimeout(total=60, connect=30, sock_read=60)
+    session = aiohttp.ClientSession(timeout=timeout)
     logger.info(f"🚀 Сервер запущен на http://{HOST}:{PORT}")
     logger.info(f"📡 Подключен к vLLM: {VLLM_URL}")
     logger.info(f"🤖 Модель: {MODEL_NAME}")
@@ -92,74 +94,81 @@ def get_pdf_page_count(pdf_bytes: bytes) -> int:
         return pdf_document.page_count
 
 
-async def process_page_with_vllm(page_image_bytes: bytes, page_num: int) -> str:
+async def process_page_with_vllm(page_image_bytes: bytes, page_num: int, retry_count: int = 3) -> str:
     """
     Отправка изображения страницы в vLLM для OCR
     Возвращает распознанный текст
     """
-    try:
-        # Кодируем изображение в base64
-        image_base64 = base64.b64encode(page_image_bytes).decode('utf-8')
-        image_url = f"data:image/png;base64,{image_base64}"
+    for attempt in range(retry_count):
+        try:
+            # Кодируем изображение в base64
+            image_base64 = base64.b64encode(page_image_bytes).decode('utf-8')
+            image_url = f"data:image/png;base64,{image_base64}"
 
-        # Формируем запрос к vLLM (OpenAI-compatible API)
-        payload = {
-            "model": MODEL_NAME,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "OCR:"
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": image_url
+            # Формируем запрос к vLLM (OpenAI-compatible API)
+            payload = {
+                "model": MODEL_NAME,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "OCR:"
+                            },
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": image_url
+                                }
                             }
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": 4096,  # Максимум токенов для вывода
-            "temperature": 0.1,  # Низкая температура для детерминированного извлечения текста
-            "top_p": 0.95
-        }
+                        ]
+                    }
+                ],
+                "max_tokens": 4096,
+                "temperature": 0.1,
+                "top_p": 0.95
+            }
 
-        # Заголовки для аутентификации
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {VLLM_API_KEY}"
-        }
+            # Заголовки для аутентификации
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {VLLM_API_KEY}"
+            }
 
-        # Отправляем запрос
-        async with session.post(f"{VLLM_URL}/v1/chat/completions",
-                                json=payload,
-                                headers=headers) as response:
+            # Отправляем запрос с увеличенным таймаутом
+            async with session.post(f"{VLLM_URL}/v1/chat/completions",
+                                    json=payload,
+                                    headers=headers) as response:
 
-            if response.status != 200:
-                error_text = await response.text()
-                raise Exception(f"vLLM вернул ошибку {response.status}: {error_text}")
+                if response.status != 200:
+                    error_text = await response.text()
+                    raise Exception(f"vLLM вернул ошибку {response.status}: {error_text}")
 
-            result = await response.json()
+                result = await response.json()
 
-            # Извлекаем текст из ответа
-            text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+                # Извлекаем текст из ответа
+                text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
 
-            # Если текст всё еще пустой или содержит только мусор
-            if not text or len(text) < 5:
-                logger.warning(f"Страница {page_num}: получен пустой или слишком короткий текст")
-                return f"\nСТРАНИЦА {page_num}\n[Пустая страница или не удалось распознать текст]\n"
+                # Если текст всё еще пустой или содержит только мусор
+                if not text or len(text) < 5:
+                    logger.warning(f"Страница {page_num}: получен пустой или слишком короткий текст")
+                    return f"\nСТРАНИЦА {page_num}\n[Пустая страница или не удалось распознать текст]\n"
 
-            logger.info(f"Страница {page_num}: распознано {len(text)} символов")
+                logger.info(f"Страница {page_num}: распознано {len(text)} символов (попытка {attempt + 1})")
 
-            # Добавляем строку с номером страницы
-            return f"\nСТРАНИЦА {page_num}\n{text}\n"
+                # Добавляем строку с номером страницы
+                return f"\nСТРАНИЦА {page_num}\n{text}\n"
 
-    except Exception as e:
-        logger.error(f"Ошибка при обработке страницы {page_num}: {e}")
-        return f"\nСТРАНИЦА {page_num}\n[Ошибка OCR: {str(e)}]\n"
+        except (ClientError, asyncio.TimeoutError, Exception) as e:
+            logger.warning(f"Ошибка при обработке страницы {page_num} (попытка {attempt + 1}/{retry_count}): {e}")
+            if attempt < retry_count - 1:
+                # Ждем перед повторной попыткой (экспоненциальная задержка)
+                wait_time = 2 ** attempt  # 1, 2, 4 секунды
+                await asyncio.sleep(wait_time)
+            else:
+                logger.error(f"Страница {page_num}: все попытки ({retry_count}) не удались")
+                return f"\nСТРАНИЦА {page_num}\n[Ошибка OCR: {str(e)}]\n"
 
 
 async def convert_pdf_page_to_image(pdf_bytes: bytes, page_num: int) -> bytes:
@@ -211,22 +220,24 @@ async def process_pdf(filename: str, pdf_bytes: bytes) -> str:
                 # Конвертируем страницу в изображение
                 page_image = await convert_pdf_page_to_image(pdf_bytes, page_num)
 
-                # Отправляем в vLLM
-                page_text = await process_page_with_vllm(page_image, page_num)
+                # Отправляем в vLLM с повторными попытками
+                page_text = await process_page_with_vllm(page_image, page_num, retry_count=3)
                 all_text.append(page_text)
 
                 # Обновляем прогресс-бар
                 pbar.update(1)
                 pbar.set_postfix({"Текущая страница": page_num})
 
-                # Небольшая задержка между запросами, чтобы не перегружать vLLM
-                await asyncio.sleep(0.1)
+                # Увеличиваем задержку между запросами для стабильности
+                await asyncio.sleep(0.5)  # Увеличил с 0.1 до 0.5 секунд
 
             except Exception as e:
                 error_msg = f"Ошибка при обработке страницы {page_num}: {str(e)}"
                 logger.error(error_msg)
                 all_text.append(f"\nСТРАНИЦА {page_num}\n[Ошибка: {str(e)}]\n")
                 pbar.update(1)
+                # При ошибке делаем дополнительную паузу
+                await asyncio.sleep(1)
                 continue
 
     # Собираем весь текст
