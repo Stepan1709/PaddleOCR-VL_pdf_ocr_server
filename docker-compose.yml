@@ -1,0 +1,9 @@
+services:
+  pdf-ocr-server:
+    build: .
+    image: paddle-pdf-ocr-server:latest
+    container_name: paddle-pdf-ocr-server
+    env_file: .env
+    ports:
+      - "9000:9000"
+    restart: unless-stopped

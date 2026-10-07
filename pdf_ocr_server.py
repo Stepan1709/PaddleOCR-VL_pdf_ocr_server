@@ -1,353 +1,204 @@
-#!/usr/bin/env python3
 """
-Сервер для обработки PDF через OCR модель PaddlePaddle/PaddleOCR-VL
-Принимает файлы по API, разбивает на страницы, отправляет в vLLM,
-возвращает текст с нумерацией страниц.
-"""
+Сервер для OCR-обработки PDF через модель PaddlePaddle/PaddleOCR-VL (vLLM).
 
-import os
-import sys
-import io
-import base64
-import json
-from datetime import datetime
-from typing import Dict, Any, Optional
+Принимает PDF по API, постранично рендерит его в изображения, отправляет каждую
+страницу в vLLM и возвращает текст с маркерами страниц.
+"""
 import asyncio
-import aiohttp
-from aiohttp import ClientTimeout, ClientError
-from fastapi import FastAPI, File, UploadFile, HTTPException
-from fastapi.responses import PlainTextResponse
-import PyPDF2
-from pdf2image import convert_from_bytes
-import fitz  # PyMuPDF - для более надежной работы с PDF
-from tqdm import tqdm
+import base64
 import logging
+import sys
 from contextlib import asynccontextmanager
+from typing import Optional
 
-# Импортируем настройки
-from config import HOST, PORT, VLLM_URL, VLLM_API_KEY, MODEL_NAME, TEMP_DIR, LOG_FILE
+import aiohttp
+import fitz  # PyMuPDF
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import PlainTextResponse
 
-# Настройка логирования
+from config import (
+    HOST, PORT, VLLM_URL, VLLM_API_KEY, MODEL_NAME, PDF_RENDER_DPI,
+    VLLM_REQUEST_TIMEOUT, VLLM_MAX_RETRIES, VLLM_REQUEST_DELAY, LOG_LEVEL, LOG_FILE,
+)
+
+VERSION = "3.1.0"
+MIN_TEXT_LENGTH = 5  # ответ короче считается нераспознанной страницей
+
+_handlers = [logging.StreamHandler(sys.stdout)]
+if LOG_FILE:
+    _handlers.append(logging.FileHandler(LOG_FILE, encoding="utf-8"))
 logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler(LOG_FILE, encoding='utf-8'),
-        logging.StreamHandler(sys.stdout)
-    ]
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    handlers=_handlers,
 )
 logger = logging.getLogger(__name__)
 
-# Глобальная переменная для сессии aiohttp
-session = None
+session: Optional[aiohttp.ClientSession] = None
+
+
+def vllm_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if VLLM_API_KEY:
+        headers["Authorization"] = f"Bearer {VLLM_API_KEY}"
+    return headers
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Управление жизненным циклом приложения"""
     global session
-    # Запуск: создаем сессию с увеличенными таймаутами
-    timeout = ClientTimeout(total=60, connect=30, sock_read=120)
-    session = aiohttp.ClientSession(timeout=timeout)
-    logger.info(f"🚀 Сервер запущен на http://{HOST}:{PORT}")
-    logger.info(f"📡 Подключен к vLLM: {VLLM_URL}")
-    logger.info(f"🤖 Модель: {MODEL_NAME}")
-
+    session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=VLLM_REQUEST_TIMEOUT, connect=30))
+    logger.info(f"Сервер запущен на http://{HOST}:{PORT}")
+    logger.info(f"vLLM: {VLLM_URL}, модель: {MODEL_NAME}")
     yield
-
-    # Завершение: закрываем сессию
-    if session:
-        await session.close()
-    logger.info("👋 Сервер остановлен")
+    await session.close()
+    logger.info("Сервер остановлен")
 
 
-# Создаем приложение FastAPI
 app = FastAPI(
     title="PDF OCR Server",
-    description="Сервер для OCR обработки PDF с помощью PaddlePaddle/PaddleOCR-VL",
-    version="3.0.0",
-    lifespan=lifespan
+    description="Сервер для OCR-обработки PDF с помощью PaddlePaddle/PaddleOCR-VL",
+    version=VERSION,
+    lifespan=lifespan,
 )
 
 
-def log_error(filename: str, error: Exception):
-    """Запись ошибки в лог-файл"""
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    error_msg = f"{timestamp} | Файл: {filename} | Ошибка: {str(error)}\n"
-
-    # Записываем в файл
-    with open(LOG_FILE, "a", encoding="utf-8") as f:
-        f.write(error_msg)
-
-    # Также выводим в консоль
-    logger.error(f"❌ Ошибка при обработке {filename}: {str(error)}")
+def page_marker(page_num: int, body: str) -> str:
+    return f"\nСТРАНИЦА {page_num}\n{body}\n"
 
 
-def get_pdf_page_count(pdf_bytes: bytes) -> int:
-    """Получение количества страниц в PDF"""
-    try:
-        pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
-        return len(pdf_reader.pages)
-    except Exception as e:
-        logger.warning(f"PyPDF2 не смог прочитать PDF, пробуем PyMuPDF: {e}")
-        pdf_document = fitz.open(stream=pdf_bytes, filetype="pdf")
-        return pdf_document.page_count
+def render_page(doc: fitz.Document, page_index: int) -> bytes:
+    """Рендерит страницу PDF (индекс с нуля) в PNG."""
+    pixmap = doc[page_index].get_pixmap(dpi=PDF_RENDER_DPI)
+    return pixmap.tobytes("png")
 
 
-async def process_page_with_vllm(page_image_bytes: bytes, page_num: int, retry_count: int = 3) -> str:
-    """
-    Отправка изображения страницы в vLLM для OCR
-    Возвращает распознанный текст
-    """
-    for attempt in range(retry_count):
+async def ocr_page(image_png: bytes, page_num: int) -> str:
+    """Отправляет изображение страницы в vLLM и возвращает распознанный текст с маркером страницы."""
+    image_url = "data:image/png;base64," + base64.b64encode(image_png).decode("utf-8")
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "OCR:"},
+                {"type": "image_url", "image_url": {"url": image_url}},
+            ],
+        }],
+        "max_tokens": 4096,
+        "temperature": 0.1,
+        "top_p": 0.95,
+    }
+
+    for attempt in range(1, VLLM_MAX_RETRIES + 1):
         try:
-            await asyncio.sleep(3)
-            # Кодируем изображение в base64
-            image_base64 = base64.b64encode(page_image_bytes).decode('utf-8')
-            image_url = f"data:image/png;base64,{image_base64}"
-
-            # Формируем запрос к vLLM (OpenAI-compatible API)
-            payload = {
-                "model": MODEL_NAME,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": "OCR:"
-                            },
-                            {
-                                "type": "image_url",
-                                "image_url": {
-                                    "url": image_url
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "max_tokens": 4096,
-                "temperature": 0.1,
-                "top_p": 0.95
-            }
-
-            # Заголовки для аутентификации
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {VLLM_API_KEY}"
-            }
-
-            # Отправляем запрос с увеличенным таймаутом
+            await asyncio.sleep(VLLM_REQUEST_DELAY)
             async with session.post(f"{VLLM_URL}/v1/chat/completions",
-                                    json=payload,
-                                    headers=headers) as response:
-
+                                    json=payload, headers=vllm_headers()) as response:
                 if response.status != 200:
-                    error_text = await response.text()
-                    raise Exception(f"vLLM вернул ошибку {response.status}: {error_text}")
-
+                    raise RuntimeError(f"vLLM вернул ошибку {response.status}: {await response.text()}")
                 result = await response.json()
 
-                # Извлекаем текст из ответа
-                text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            text = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+            if len(text) < MIN_TEXT_LENGTH:
+                logger.warning(f"Страница {page_num}: пустой или слишком короткий текст")
+                return page_marker(page_num, "[Пустая страница или не удалось распознать текст]")
 
-                # Если текст всё еще пустой или содержит только мусор
-                if not text or len(text) < 5:
-                    logger.warning(f"Страница {page_num}: получен пустой или слишком короткий текст")
-                    return f"\nСТРАНИЦА {page_num}\n[Пустая страница или не удалось распознать текст]\n"
+            logger.info(f"Страница {page_num}: распознано {len(text)} символов (попытка {attempt})")
+            return page_marker(page_num, text)
 
-                logger.info(f"Страница {page_num}: распознано {len(text)} символов (попытка {attempt + 1})")
-
-                # Добавляем строку с номером страницы
-                return f"\nСТРАНИЦА {page_num}\n{text}\n"
-
-        except (ClientError, asyncio.TimeoutError, Exception) as e:
-            logger.warning(f"Ошибка при обработке страницы {page_num} (попытка {attempt + 1}/{retry_count}): {e}")
-            if attempt < retry_count - 1:
-                # Ждем перед повторной попыткой (экспоненциальная задержка)
-                wait_time = 3 + (2 ** attempt)
-                await asyncio.sleep(wait_time)
-            else:
-                logger.error(f"Страница {page_num}: все попытки ({retry_count}) не удались")
-                return f"\nСТРАНИЦА {page_num}\n[Ошибка OCR: {str(e)}]\n"
-
-
-async def convert_pdf_page_to_image(pdf_bytes: bytes, page_num: int) -> bytes:
-    """
-    Конвертирует конкретную страницу PDF в изображение
-    Использует pdf2image для конвертации
-    """
-    try:
-        # Используем pdf2image для конвертации страницы
-        images = convert_from_bytes(
-            pdf_bytes,
-            first_page=page_num,
-            last_page=page_num,
-            dpi=300,  # Высокое разрешение для лучшего распознавания
-            fmt='png'
-        )
-
-        if not images:
-            raise Exception(f"Не удалось конвертировать страницу {page_num}")
-
-        # Конвертируем изображение в байты
-        img_byte_arr = io.BytesIO()
-        images[0].save(img_byte_arr, format='PNG', optimize=False)
-        img_byte_arr.seek(0)
-
-        return img_byte_arr.getvalue()
-
-    except Exception as e:
-        logger.error(f"Ошибка конвертации страницы {page_num}: {e}")
-        raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            logger.warning(f"Страница {page_num}: ошибка (попытка {attempt}/{VLLM_MAX_RETRIES}): {e!r}")
+            if attempt == VLLM_MAX_RETRIES:
+                logger.error(f"Страница {page_num}: все попытки не удались")
+                return page_marker(page_num, f"[Ошибка OCR: {e}]")
+            await asyncio.sleep(3 + 2 ** (attempt - 1))
 
 
 async def process_pdf(filename: str, pdf_bytes: bytes) -> str:
-    """
-    Основная функция обработки PDF
-    Разбивает на страницы, отправляет в vLLM, собирает результат
-    """
-    # Получаем количество страниц
-    total_pages = get_pdf_page_count(pdf_bytes)
-    logger.info(f"📄 Получен файл: {filename}")
-    logger.info(f"📑 Количество страниц в файле: {total_pages}")
+    """Рендерит страницы PDF, распознаёт их последовательно и собирает результат."""
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    except Exception as e:
+        raise ValueError(f"Не удалось открыть PDF: {e}") from e
 
-    all_text = []
+    with doc:
+        total_pages = doc.page_count
+        logger.info(f"Получен файл: {filename}, страниц: {total_pages}")
 
-    # Создаем прогресс-бар для обработки страниц
-    with tqdm(total=total_pages, desc="Обработка страниц", unit="стр") as pbar:
-        for page_num in range(1, total_pages + 1):
+        parts = []
+        for page_index in range(total_pages):
+            page_num = page_index + 1
             try:
-                # Конвертируем страницу в изображение
-                page_image = await convert_pdf_page_to_image(pdf_bytes, page_num)
-
-                # Отправляем в vLLM с повторными попытками
-                page_text = await process_page_with_vllm(page_image, page_num, retry_count=3)
-                all_text.append(page_text)
-
-                # Обновляем прогресс-бар
-                pbar.update(1)
-                pbar.set_postfix({"Текущая страница": page_num})
-
-                # Увеличиваем задержку между запросами для стабильности
-                await asyncio.sleep(0.5)  # Увеличил с 0.1 до 0.5 секунд
-
+                image = await asyncio.to_thread(render_page, doc, page_index)
+                parts.append(await ocr_page(image, page_num))
             except Exception as e:
-                error_msg = f"Ошибка при обработке страницы {page_num}: {str(e)}"
-                logger.error(error_msg)
-                all_text.append(f"\nСТРАНИЦА {page_num}\n[Ошибка: {str(e)}]\n")
-                pbar.update(1)
-                # При ошибке делаем дополнительную паузу
-                await asyncio.sleep(1)
-                continue
+                logger.error(f"Страница {page_num}: ошибка обработки: {e!r}")
+                parts.append(page_marker(page_num, f"[Ошибка: {e}]"))
 
-    # Собираем весь текст
-    full_text = "".join(all_text)
-
-    logger.info(f"✅ Файл \"{filename}\" успешно обработан. Всего страниц: {total_pages}")
-
-    return full_text
+    logger.info(f'Файл "{filename}" обработан, страниц: {total_pages}')
+    return "".join(parts)
 
 
 @app.post("/ocr", response_class=PlainTextResponse)
 async def ocr_pdf(file: UploadFile = File(...)) -> str:
     """
-    Основной эндпоинт для обработки PDF
+    Принимает PDF, возвращает текст с нумерацией страниц.
 
-    Принимает PDF файл, возвращает текст с нумерацией страниц
-
-    Пример использования:
-    curl -X POST -F "file=@document.pdf" http://localhost:9000/ocr
+    Пример: curl -X POST -F "file=@document.pdf" http://localhost:9000/ocr
     """
-    # Проверяем тип файла
-    if not file.filename.lower().endswith('.pdf'):
-        raise HTTPException(
-            status_code=400,
-            detail="Файл должен быть в формате PDF"
-        )
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Файл должен быть в формате PDF")
 
-    # Читаем содержимое файла
+    pdf_bytes = await file.read()
+    if not pdf_bytes:
+        raise HTTPException(status_code=400, detail="Файл пуст")
+
     try:
-        pdf_bytes = await file.read()
-
-        # Проверяем, что файл не пустой
-        if len(pdf_bytes) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Файл пуст"
-            )
-
-        # Обрабатываем PDF
-        result_text = await process_pdf(file.filename, pdf_bytes)
-
-        return result_text
-
+        return await process_pdf(file.filename, pdf_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
-        # Логируем ошибку
-        log_error(file.filename, e)
+        logger.exception(f"Ошибка при обработке {file.filename}")
+        raise HTTPException(status_code=500, detail=f"Ошибка при обработке файла: {e}")
 
-        # Возвращаем ошибку клиенту
-        raise HTTPException(
-            status_code=500,
-            detail=f"Ошибка при обработке файла: {str(e)}"
-        )
-    finally:
-        # Принудительно освобождаем память
-        if 'pdf_bytes' in locals():
-            del pdf_bytes
+
+@app.get("/live")
+async def liveness():
+    """Проверка, что процесс жив (без обращения к vLLM)."""
+    return {"status": "alive"}
 
 
 @app.get("/health")
 async def health_check():
-    """Проверка работоспособности сервера"""
-    # Проверяем доступность vLLM
+    """Проверка доступности vLLM и нужной модели."""
+    headers = {"Authorization": f"Bearer {VLLM_API_KEY}"} if VLLM_API_KEY else {}
     try:
-        headers = {"Authorization": f"Bearer {VLLM_API_KEY}"}
         async with session.get(f"{VLLM_URL}/v1/models", headers=headers) as response:
-            if response.status == 200:
-                models = await response.json()
-                model_available = any(MODEL_NAME in m.get("id", "") for m in models.get("data", []))
-                return {
-                    "status": "healthy",
-                    "vllm": "connected",
-                    "model_available": model_available
-                }
-            else:
-                return {
-                    "status": "degraded",
-                    "vllm": f"error_{response.status}"
-                }
+            if response.status != 200:
+                return {"status": "degraded", "vllm": f"error_{response.status}"}
+            models = await response.json()
+            model_available = any(MODEL_NAME in m.get("id", "") for m in models.get("data", []))
+            return {"status": "healthy", "vllm": "connected", "model_available": model_available}
     except Exception as e:
-        return {
-            "status": "degraded",
-            "vllm": "disconnected",
-            "error": str(e)
-        }
+        return {"status": "degraded", "vllm": "disconnected", "error": str(e)}
 
 
 @app.get("/")
 async def root():
-    """Корневой эндпоинт с информацией о сервере"""
     return {
         "service": "PDF OCR Server",
-        "version": "3.0.0",
+        "version": VERSION,
         "endpoints": {
             "ocr": "POST /ocr - Отправить PDF файл для OCR",
-            "health": "GET /health - Проверка состояния сервера"
+            "live": "GET /live - Liveness-проба",
+            "health": "GET /health - Состояние сервера и vLLM",
         },
         "model": MODEL_NAME,
-        "vllm_url": VLLM_URL
     }
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    # Запускаем сервер
-    uvicorn.run(
-        app,
-        host=HOST,
-        port=PORT,
-        log_level="info",
-        access_log=True
-    )
+    uvicorn.run(app, host=HOST, port=PORT, log_level=LOG_LEVEL.lower(), access_log=True)
