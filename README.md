@@ -33,6 +33,7 @@ s3_to_qdrant_synchronizer ──> file_to_text_converter_server ──> PaddleOC
 | `VLLM_REQUEST_TIMEOUT` | `60`                       | Таймаут одного запроса к vLLM, сек                           |
 | `VLLM_MAX_RETRIES`     | `3`                        | Число попыток на страницу                                    |
 | `VLLM_REQUEST_DELAY`   | `3`                        | Пауза перед каждым запросом к vLLM, сек                      |
+| `MAX_UPLOAD_SIZE_MB`   | `100`                      | Максимальный размер загружаемого PDF, МБ                     |
 | `HOST` / `PORT`        | `0.0.0.0` / `9000`         | Адрес и порт сервиса (в Docker-образе проброшен `9000`)      |
 | `LOG_LEVEL`            | `INFO`                     | Уровень логирования                                          |
 | `LOG_FILE`             | пусто                      | Путь к файлу логов; по умолчанию логи только в stdout        |
@@ -63,7 +64,7 @@ docker logs -f --tail 100 paddle-pdf-ocr-server
 python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 export VLLM_URL=http://<host>:8400 VLLM_API_KEY=<key>
-python pdf_ocr_server.py
+python -m app
 ```
 
 ## API
@@ -91,4 +92,31 @@ curl http://localhost:9000/health
 Текст второй страницы...
 ```
 
-Ошибки: `400` — не PDF, пустой или повреждённый файл; `500` — прочие ошибки обработки.
+Ошибки: `400` — не PDF, пустой или повреждённый файл; `413` — файл больше `MAX_UPLOAD_SIZE_MB`; `500` — прочие ошибки обработки.
+
+## Структура проекта
+
+```
+app/
+├── main.py            # сборка приложения и lifespan (создание HTTP-клиента)
+├── __main__.py        # запуск: python -m app
+├── core/              # конфигурация, логирование, исключения
+├── api/
+│   ├── deps.py        # зависимости FastAPI
+│   └── routers/       # HTTP-эндпоинты (ocr, health)
+├── schemas/           # pydantic-схемы ответов
+├── services/          # рендер PDF и сценарий OCR с повторами
+└── clients/           # клиент vLLM
+tests/                 # pytest
+```
+
+## Разработка
+
+```bash
+pip install -r requirements-dev.txt
+pre-commit install          # ruff и mypy перед каждым коммитом
+ruff check . && ruff format --check . && mypy app
+pytest
+```
+
+Те же проверки запускаются в GitHub Actions (`.github/workflows/ci.yml`).
